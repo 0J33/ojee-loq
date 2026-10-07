@@ -364,6 +364,95 @@ def drive_usage(dev):
     except Exception:
         return 0, 0
 
+# Filesystems that are not on a disk in this machine. statvfs on a network
+# mount asks the far end, and an sshfs whose server went away blocks the
+# caller indefinitely; the sampler answers once a second and must not.
+_NETWORK_FS = ('nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'fuse.sshfs',
+               'fuse.rclone', 'fuse.gvfsd-fuse', '9p', 'ceph', 'glusterfs')
+_SKIP_MOUNT_PREFIXES = ('/snap', '/var/snap', '/var/lib/docker',
+                        '/var/lib/containerd', '/run', '/sys', '/proc', '/dev')
+
+def _parent_disk(dev):
+    """sda1 -> sda, nvme0n1p2 -> nvme0n1, dm-0 -> its first slave's disk."""
+    name = os.path.basename(os.path.realpath(dev))
+    base = f'/sys/class/block/{name}'
+    if not os.path.exists(base):
+        return name
+    slaves = glob.glob(f'{base}/slaves/*')
+    if slaves:
+        return _parent_disk('/dev/' + os.path.basename(slaves[0]))
+    if os.path.exists(f'{base}/partition'):
+        return os.path.basename(os.path.dirname(os.path.realpath(base)))
+    return name
+
+def list_mounts():
+    """Every real filesystem mounted from a local block device, one row per
+    device (the shortest mount point wins, so bind mounts do not repeat it),
+    with size, used, free and the physical disk it lives on."""
+    seen = {}
+    try:
+        with open('/proc/self/mounts') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    for line in lines:
+        p = line.split()
+        if len(p) < 3:
+            continue
+        dev, mp, fstype = p[0], _unescape_mount_path(p[1]), p[2]
+        if not dev.startswith('/dev/') or fstype in _NETWORK_FS or dev.startswith('/dev/loop'):
+            continue
+        if fstype in ('squashfs', 'overlay', 'tmpfs', 'devtmpfs'):
+            continue
+        if any(mp == x or mp.startswith(x + '/') for x in _SKIP_MOUNT_PREFIXES):
+            continue
+        if dev not in seen or len(mp) < len(seen[dev][0]):
+            seen[dev] = (mp, fstype)
+    out = []
+    for dev, (mp, fstype) in seen.items():
+        try:
+            s = os.statvfs(mp)
+        except OSError:
+            continue
+        total = s.f_blocks * s.f_frsize
+        if total <= 0:
+            continue
+        free = s.f_bavail * s.f_frsize
+        out.append({'mount': mp, 'device': dev, 'disk': _parent_disk(dev),
+                    'fstype': fstype, 'total': total,
+                    'used': total - s.f_bfree * s.f_frsize, 'free': free})
+    out.sort(key=lambda m: -m['total'])
+    return out
+
+_OS_NAME = None
+
+def os_name():
+    """PRETTY_NAME from os-release ("Zorin OS 18.1"), else NAME + VERSION.
+    Read once: it does not change while the agent is running."""
+    global _OS_NAME
+    if _OS_NAME is not None:
+        return _OS_NAME or None
+    kv = {}
+    for path in ('/etc/os-release', '/usr/lib/os-release'):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' not in line or line.startswith('#'):
+                        continue
+                    k, v = line.split('=', 1)
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+                        v = v[1:-1]
+                    kv[k] = v.replace('\\"', '"')
+            break
+        except OSError:
+            continue
+    name = kv.get('PRETTY_NAME') or ' '.join(
+        x for x in (kv.get('NAME'), kv.get('VERSION') or kv.get('VERSION_ID')) if x)
+    _OS_NAME = name or ''
+    return name or None
+
 def list_active_nics():
     """Active non-loopback interfaces with type, SSID/IP info."""
     nics = []

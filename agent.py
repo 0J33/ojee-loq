@@ -199,6 +199,11 @@ class Sampler:
             },
             'state': _control_state(),
             'drives': hw.list_drives(),
+            # Mounted filesystems with usage, and what the machine says it
+            # runs. Both are what a fleet view needs and the drives list
+            # (hardware only, no usage) cannot give it.
+            'mounts': hw.list_mounts(),
+            'os': hw.os_name(),
             'nics': hw.list_active_nics(),
         }
 
